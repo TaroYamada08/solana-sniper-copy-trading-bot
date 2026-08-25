@@ -32,12 +32,12 @@ const checkWalletBalance = async () => {
     const { getBalance } = await import("./swap.js");
     const balance = await getBalance();
     
-    if (balance < 1) {
-      logger.error("Wallet balance is below 1 SOL. Current balance:", balance, "SOL");
+    if (balance < config.trading.minWalletSol) {
+      logger.error(`Wallet balance is below ${config.trading.minWalletSol} SOL. Current balance: ${balance} SOL`);
       await notificationService.sendNotification(
         `❌ Insufficient wallet balance: ${balance} SOL`,
         'error',
-        { balance, required: 1 }
+        { balance, required: config.trading.minWalletSol }
       );
       process.exit(1);
     }
@@ -117,8 +117,11 @@ process.on('unhandledRejection', async (reason, promise) => {
 const handleShutdown = async (reason) => {
   try {
     logger.info("Initiating graceful shutdown...");
-    
-    // Get final statistics
+    const { stopNewLaunch } = await import("./grpc.js");
+    const { closeAllPositions } = await import("./services/engine.js");
+    stopNewLaunch();
+    await closeAllPositions("shutdown");
+
     const finalStats = riskManager.getDailyStats();
     const riskMetrics = riskManager.getRiskMetrics();
     

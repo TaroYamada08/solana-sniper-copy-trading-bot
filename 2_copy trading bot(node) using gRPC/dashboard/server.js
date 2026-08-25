@@ -7,6 +7,7 @@ import { config } from '../config.js';
 import logger from '../utils/logger.js';
 import riskManager from '../services/riskManager.js';
 import notificationService from '../services/notifications.js';
+import { getEngineStats, closeAllPositions } from '../services/engine.js';
 
 const app = express();
 const PORT = process.env.DASHBOARD_PORT || 3000;
@@ -116,7 +117,6 @@ app.get('/api/history', (req, res) => {
   }
 });
 
-// Get daily statistics
 app.get('/api/stats', (req, res) => {
   try {
     const dailyStats = riskManager.getDailyStats();
@@ -127,11 +127,24 @@ app.get('/api/stats', (req, res) => {
   }
 });
 
+app.get('/api/engine', (req, res) => {
+  try {
+    res.json({
+      ...getEngineStats(),
+      modes: config.modes,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    logger.error('Error getting engine stats', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // Emergency actions
 app.post('/api/emergency/close-all', async (req, res) => {
   try {
     const { reason } = req.body;
-    const results = await riskManager.emergencyCloseAll(reason || 'dashboard_request');
+    const results = await closeAllPositions(reason || 'dashboard_request');
     
     res.json({
       success: true,

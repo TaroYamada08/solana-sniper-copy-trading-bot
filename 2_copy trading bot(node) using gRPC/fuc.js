@@ -19,7 +19,6 @@ export const token_buy = async (mint, sol_amount, pool_status,  context) => {
   }
   const currentUTC = new Date();
   const txid = await swap("BUY", mint, sol_amount * LAMPORTS_PER_SOL);
-  // let txid = "";
   console.log(chalk.green(`🟢BUY tokenAmount:::${sol_amount} pool_status: ${pool_status} `));
 
   //============off chain sign ultra fast============//
@@ -36,7 +35,8 @@ export const token_buy = async (mint, sol_amount, pool_status,  context) => {
   const endUTC = new Date();
   const timeTaken = endUTC.getTime() - currentUTC.getTime();
   console.log(`⏱️ Total BUY time taken: ${timeTaken}ms (${(timeTaken / 1000).toFixed(2)}s)`);
-  return txid;
+  if (!txid || txid === "stop") return txid;
+  return { txHash: txid };
 };
 
 export const token_sell = async (mint, tokenAmount, pool_status, isFull, context) => {
@@ -72,7 +72,7 @@ export const token_sell = async (mint, tokenAmount, pool_status, isFull, context
 
     if (txid) {
       console.log(chalk.green(`Successfully sold ${tokenAmount} tokens : https://solscan.io/tx/${txid}`));
-      return txid;
+      return { txHash: txid };
     }
 
     return null;

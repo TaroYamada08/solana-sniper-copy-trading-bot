@@ -121,7 +121,7 @@ export const getBalance = async () => {
 const getResponse = async (tokenA, tokenB, amount, slippageBps, anchorWallet) => {
   const quoteResponse = (
     await axios.get(
-      `https://lite-api.jup.ag/swap/v1/quote?inputMint=${tokenA}&outputMint=${tokenB}&amount=${amount}&slippageBps=${slippageBps}`
+      `https://lite-api.jup.ag/swap/v1/quote?inputMint=${tokenA}&outputMint=${tokenB}&amount=${amount}&slippageBps=${slippageBps}&restrictIntermediateTokens=true`
     )
   ).data;
 
@@ -145,7 +145,7 @@ const getResponse = async (tokenA, tokenB, amount, slippageBps, anchorWallet) =>
   // "nozomi" handled in executeTransaction
 
   const swapResponse = await axios.post(`https://lite-api.jup.ag/swap/v1/swap`, swapRequestBody);
-  return swapResponse;
+  return swapResponse.data;
 };
 
 const executeTransaction = async (connection, swapTransaction, anchorWallet) => {
@@ -188,6 +188,7 @@ const executeTransaction = async (connection, swapTransaction, anchorWallet) => 
       });
 
       console.log("Nozomi response: txid: %s", txid);
+      return txid;
     } else {
       console.log("Standard/JITO/0slot/solana/race: send via normal connection");
       // Standard/JITO/0slot/solana/race: send via normal connection

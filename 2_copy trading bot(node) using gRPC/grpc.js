@@ -1,81 +1,146 @@
 import "dotenv/config";
 import Client from "@triton-one/yellowstone-grpc";
 import { CommitmentLevel } from "@triton-one/yellowstone-grpc";
-import { decodeInstruction } from '@solana/spl-token';
-import { Connection, Keypair } from '@solana/web3.js';
 import chalk from "chalk";
+import bs58 from "bs58";
 import { tOutPut } from "./parsingtransaction.js";
-import { handleNewTokenLaunch } from "./main.js";
-import dotenv from 'dotenv'
-dotenv.config();
-const GRPCTOKEN=process.env.GRPCTOKEN
-const GRPC_ENDPOINT = process.env.GRPC_ENDPOINT
+import { onChainEvent } from "./services/engine.js";
+import { config, getEnabledProgramIds, PROGRAM_IDS } from "./config.js";
+import logger from "./utils/logger.js";
 
-// Pre-define constants
-const SOLANA_TOKEN = "So11111111111111111111111111111111111111112";
-const RAYDIUM_FEE = "LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj"//"7YttLkHDoNj9wyDur5pM1ejNaAvT9X4eqaYcHQqtj2G5";
-const Raydium_launchpad_authority = "WLHv2UAZm6z4KyaaELi5pjdbJh6RESMva1Rnn8pJVVh"
-// Create default client
-const defaultClient = new Client(
-  GRPC_ENDPOINT,
-  GRPCTOKEN
-);
+const GRPCTOKEN = process.env.GRPCTOKEN;
+const GRPC_ENDPOINT = process.env.GRPC_ENDPOINT;
+const SOLANA_TOKEN = PROGRAM_IDS.WSOL;
+const Raydium_launchpad_authority = "WLHv2UAZm6z4KyaaELi5pjdbJh6RESMva1Rnn8pJVVh";
+
+const defaultClient = new Client(GRPC_ENDPOINT, GRPCTOKEN);
 
 export let isNewLaunchRunning = true;
 export const stopNewLaunch = () => {
   isNewLaunchRunning = false;
-  console.log(chalk.red("New launch monitoring stopped"));
+  logger.warn("Stream monitoring stopped");
 };
 
-// Default request args
-const defaultArgs = {
-  accounts: {},
-  slots: {},
-  transactions: {
-    pumpfun: {
+const buildSubscribeArgs = () => {
+  const transactions = {};
+  const programIds = getEnabledProgramIds();
+
+  if ((config.modes.sniper || config.modes.arbitrage) && programIds.length) {
+    transactions.launches = {
       vote: false,
       failed: false,
       signature: undefined,
-      accountInclude: [RAYDIUM_FEE],
+      accountInclude: programIds,
       accountExclude: [],
       accountRequired: [],
-    },
-  },
-  transactionsStatus: {},
-  entry: {},
-  blocks: {},
-  blocksMeta: {},
-  accountsDataSlice: [],
-  ping: undefined,
-  commitment: CommitmentLevel.PROCESSED,
+    };
+  }
+
+  if (config.modes.copy && config.copy.wallets.length) {
+    transactions.copy = {
+      vote: false,
+      failed: false,
+      signature: undefined,
+      accountInclude: config.copy.wallets,
+      accountExclude: [],
+      accountRequired: [],
+    };
+  }
+
+  return {
+    accounts: {},
+    slots: {},
+    transactions,
+    transactionsStatus: {},
+    entry: {},
+    blocks: {},
+    blocksMeta: {},
+    accountsDataSlice: [],
+    ping: undefined,
+    commitment: CommitmentLevel.PROCESSED,
+  };
 };
 
-// This function checks for MintTo instructions by comparing with log messages
-async function checkMintTo(data) {
-  const tx = data.transaction?.transaction;
-  const meta = data.transaction;
-  if (!tx || !meta?.transaction?.meta?.logMessages) return;
-  // Find if MintTo is present in log messages
-  const mintToLog = meta.transaction.meta.logMessages.find((log) =>
-    typeof log === "string" && log.toLowerCase().includes("instruction: mintto")
-  );
-
-  if (mintToLog) {
-    console.log("🩸🩸🩸🩸🩸 MintTo found in logs!");
-    return true
-  } else {
-    // No MintTo found in logs
-    return false
+function encodeSignature(dataTx) {
+  try {
+    const sig = dataTx?.transaction?.signatures?.[0] || dataTx?.signature;
+    if (!sig) return null;
+    return typeof sig === "string" ? sig : bs58.encode(Buffer.from(sig));
+  } catch {
+    return null;
   }
 }
 
+function getAccountKeys(dataTx) {
+  const keys =
+    dataTx?.transaction?.message?.accountKeys ||
+    dataTx?.transaction?.message?.staticAccountKeys ||
+    [];
+  return keys.map((key) => {
+    if (typeof key === "string") return key;
+    if (key?.pubkey) return String(key.pubkey);
+    try {
+      return bs58.encode(Buffer.from(key));
+    } catch {
+      return String(key);
+    }
+  });
+}
 
-async function handleStream(client = defaultClient, args = defaultArgs) {
+function extractBalanceDeltas(meta) {
+  const preTokenBalances = meta?.preTokenBalances || [];
+  const postTokenBalances = meta?.postTokenBalances || [];
+  if (!postTokenBalances.length) return null;
+
+  let pre_sol = 0;
+  let post_sol = 0;
+  let pre_token = 0;
+  let post_token = 0;
+  let token_mint = "";
+  let token_owner = "";
+
+  for (const balance of postTokenBalances) {
+    if (balance.owner !== Raydium_launchpad_authority) {
+      if (balance.mint !== SOLANA_TOKEN) {
+        post_token = balance.uiTokenAmount?.uiAmount || 0;
+        token_mint = balance.mint;
+        token_owner = balance.owner;
+      }
+    } else {
+      post_sol = balance.uiTokenAmount?.uiAmount || 0;
+    }
+  }
+
+  for (const balance of preTokenBalances) {
+    if (balance.owner !== Raydium_launchpad_authority) {
+      if (balance.mint !== SOLANA_TOKEN) {
+        pre_token = balance.uiTokenAmount?.uiAmount || 0;
+      }
+    } else {
+      pre_sol = balance.uiTokenAmount?.uiAmount || 0;
+    }
+  }
+
+  return {
+    tokenMint: token_mint,
+    tokenOwner: token_owner,
+    solChanges: post_sol - pre_sol,
+    tokenChanges: post_token - pre_token,
+  };
+}
+
+function hasMintTo(meta) {
+  const logs = meta?.logMessages;
+  if (!Array.isArray(logs)) return false;
+  return logs.some((log) => typeof log === "string" && log.toLowerCase().includes("instruction: mintto"));
+}
+
+async function handleStream(client = defaultClient, args = buildSubscribeArgs()) {
   const stream = await client.subscribe(args);
 
   const streamClosed = new Promise((resolve, reject) => {
     stream.on("error", (error) => {
-      console.error("Stream Error:", error);
+      logger.error("Stream Error", error);
       reject(error);
       stream.end();
     });
@@ -83,122 +148,87 @@ async function handleStream(client = defaultClient, args = defaultArgs) {
     stream.on("close", resolve);
   });
 
-  stream.on("data", async (data) => {
-    // Return early if monitoring is disabled
+  stream.on("data", (data) => {
     if (!isNewLaunchRunning) {
       stream.end();
       return;
     }
-    
-    try {
-    //   console.log(chalk.green("start__________new token streaming_________"));
-      if (!data?.transaction?.transaction) {
-        return null;
-      }
-      const mintTo = await checkMintTo(data)
-      if(!mintTo){
-        return null
-    }        
-    console.log(`[${new Date().toISOString()}] 🩸🩸🩸🩸🩸 MintTo found in logs!`);
-
-      const preTokenBalances = data?.transaction?.transaction?.meta?.preTokenBalances;
-      const postTokenBalances = data?.transaction?.transaction?.meta?.postTokenBalances;
-
-      if (!preTokenBalances || !postTokenBalances) {
-        console.log("Token balances not found in transaction data");
-        return null;
-      }
-
-      let pre_sol = 0;
-      let post_sol = 0;
-      let pre_token = 0;
-      let post_token = 0;
-      let token_mint = "";
-      let token_owner = "";
-
-    
-      for (const balance of postTokenBalances) {
-        if (balance.owner !== Raydium_launchpad_authority) {
-          if (balance.mint !== SOLANA_TOKEN) {
-            post_token = balance.uiTokenAmount.uiAmount || 0;
-            token_mint = balance.mint;
-            token_owner = balance.owner;
-          }
-        } else {
-          post_sol = balance.uiTokenAmount.uiAmount || 0;
-        }
-      }
-
-      for (const balance of preTokenBalances) {
-        if (balance.owner !== Raydium_launchpad_authority) {
-          if (balance.mint !== SOLANA_TOKEN) {
-            pre_token = balance.uiTokenAmount.uiAmount || 0;
-          }
-        }
-      }
-
-      const solChanges = post_sol-pre_sol;
-      const tokenChanges = post_token-pre_token;
-      console.log(chalk.bgBlue.bold(`🪙 Token Mint:`), chalk.white(token_mint));
-      console.log(chalk.bgMagenta.bold(`👤 Token Owner:`), chalk.white(token_owner));
-      console.log(chalk.bgYellow.bold(`💸 SOL Balance Change:`), chalk.yellow(`${solChanges > 0 ? "+" : ""}${solChanges}`));
-      console.log(chalk.bgCyan.bold(`🔄 Token Balance Change:`), chalk.cyan(`${tokenChanges > 0 ? "+" : ""}${tokenChanges}`));
-
-     
-      if (solChanges> 0.1) {
-        console.log(chalk.bgGreen("Found large SOL transfer:", solChanges));
-       
-        // Parse transaction data to get pool information
-        const parsedData = await tOutPut(data);
-        if (parsedData) {
-          console.log(chalk.cyan(`Pool status: Raydium launchpad`));
-          
-          // Call the main bot logic to handle the new token launch
-          await handleNewTokenLaunch(token_mint, parsedData.pool_status, parsedData.context);
-        } else {
-          console.log(chalk.yellow("Failed to parse transaction data"));
-        }
-        
-        return token_mint;
-      }
-
-      return null;
-    } catch (error) {
-      console.error("Error processing transaction data:", error);
-      return null;
-    }
+    processUpdate(data).catch((error) => logger.error("Error processing transaction data", error));
   });
 
   try {
     await stream.write(args);
   } catch (error) {
-    console.error("Subscription request failed:", error);
+    logger.error("Subscription request failed", error);
     throw error;
   }
 
   await streamClosed;
 }
 
-export async function newlunched_subscribeCommand(client = defaultClient, args = defaultArgs) {
-  // Set monitoring flag to true when starting
+async function processUpdate(data) {
+  if (!data?.transaction?.transaction) return;
+
+  const dataTx = data.transaction.transaction;
+  const meta = dataTx?.meta || data.transaction?.meta;
+  const filters = data.filters || [];
+  const isMintTo = hasMintTo(meta);
+  const deltas = extractBalanceDeltas(meta);
+  const parsed = await tOutPut(data);
+  const keys = getAccountKeys(dataTx);
+  const user = parsed?.user || deltas?.tokenOwner || keys[0];
+  const mint = parsed?.mint || deltas?.tokenMint;
+  const solMoved = Math.abs(deltas?.solChanges || 0) || undefined;
+
+  if (isMintTo) {
+    logger.info(`[${new Date().toISOString()}] MintTo detected`);
+    if (mint) {
+      console.log(chalk.bgBlue.bold(`🪙 Token Mint:`), chalk.white(mint));
+      console.log(chalk.bgMagenta.bold(`👤 Token Owner:`), chalk.white(user || ""));
+      if (deltas) {
+        console.log(
+          chalk.bgYellow.bold(`💸 SOL Balance Change:`),
+          chalk.yellow(`${deltas.solChanges > 0 ? "+" : ""}${deltas.solChanges}`)
+        );
+      }
+    }
+  }
+
+  await onChainEvent({
+    parsed,
+    filters,
+    isMintTo,
+    extras: {
+      mint,
+      user,
+      solMoved,
+      tokenChange: deltas?.tokenChanges,
+      signature: encodeSignature(dataTx),
+    },
+  });
+}
+
+export async function newlunched_subscribeCommand(client = defaultClient, args = buildSubscribeArgs()) {
   isNewLaunchRunning = true;
-  console.log(chalk.green("New launch monitoring started"));
+  const names = Object.keys(args.transactions || {});
+  logger.info(`gRPC monitoring started (${names.join(", ") || "none"})`);
+
+  if (!names.length) {
+    logger.error("No gRPC filters configured. Enable sniper/copy/arbitrage and pool types.");
+    return;
+  }
 
   while (isNewLaunchRunning) {
     try {
       await handleStream(client, args);
     } catch (error) {
-      console.error("Stream error, restarting in 1 second...", error);
-      // Only wait and retry if monitoring is still enabled
+      logger.error("Stream error, restarting in 1 second...", error);
       if (isNewLaunchRunning) {
         await new Promise((resolve) => setTimeout(resolve, 1000));
       }
     }
   }
-  console.log("New launch monitoring stopped");
+  logger.info("gRPC monitoring stopped");
 }
 
-// Export client and args for external use
-export { defaultClient, defaultArgs };
-// Remove the auto-execution to prevent conflicts
-// newlunched_subscribeCommand()
+export { defaultClient, buildSubscribeArgs as defaultArgs };

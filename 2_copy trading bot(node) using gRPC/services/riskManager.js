@@ -62,7 +62,7 @@ class RiskManager {
   }
 
   // Record a new trade
-  recordTrade(tradeType, tokenMint, amount, price, txHash) {
+  recordTrade(tradeType, tokenMint, amount, price, txHash, extra = {}) {
     const now = Date.now();
     this.lastTradeTime = now;
 
@@ -75,35 +75,51 @@ class RiskManager {
       txHash,
       timestamp: now,
       status: 'pending',
+      source: extra.source || 'unknown',
     };
 
     if (tradeType === 'buy') {
+      const entryValue = amount;
       this.activePositions.set(tokenMint, {
-        entryPrice: price,
+        mint: tokenMint,
+        entryPrice: price || 1,
         entryAmount: amount,
         entryTime: now,
-        entryValue: amount * price,
-        currentPrice: price,
+        entryValue,
+        currentPrice: price || 1,
+        currentValue: entryValue,
+        pnl: 0,
+        pnlRatio: 1,
+        peakValue: entryValue,
+        peakRatio: 1,
+        peakTime: now,
+        remainingFraction: 1,
+        scaledLevelsHit: [],
         tradeId: trade.id,
+        source: extra.source || 'snipe',
+        poolStatus: extra.poolStatus,
+        context: extra.context,
+        maxHoldTime: extra.maxHoldTime,
+        targetWallet: extra.targetWallet,
       });
 
       logger.info(`Position opened: ${tokenMint}`, {
-        entryPrice: price,
         entryAmount: amount,
-        entryValue: amount * price,
+        entryValue,
+        source: extra.source,
       });
 
       notificationService.notifyPositionUpdate('opened', tokenMint, {
-        entryPrice: price,
         entryAmount: amount,
-        entryValue: amount * price,
+        entryValue,
+        source: extra.source,
       });
     } else if (tradeType === 'sell') {
       const position = this.activePositions.get(tokenMint);
       if (position) {
-        const exitValue = amount * price;
+        const exitValue = Number(position.currentValue) || amount * (price || 0);
         const pnl = exitValue - position.entryValue;
-        const pnlRatio = exitValue / position.entryValue;
+        const pnlRatio = position.entryValue > 0 ? exitValue / position.entryValue : 1;
 
         trade.pnl = pnl;
         trade.pnlRatio = pnlRatio;
@@ -151,7 +167,46 @@ class RiskManager {
       position.currentPrice = newPrice;
       position.currentValue = position.entryAmount * newPrice;
       position.pnl = position.currentValue - position.entryValue;
-      position.pnlRatio = position.currentValue / position.entryValue;
+      position.pnlRatio = position.entryValue > 0 ? position.currentValue / position.entryValue : 1;
+      this.touchPeak(position);
+    }
+  }
+
+  updatePositionMark(tokenMint, currentValueSol) {
+    const position = this.activePositions.get(tokenMint);
+    if (!position || !currentValueSol || currentValueSol <= 0) return;
+
+    position.currentValue = currentValueSol;
+    position.pnl = currentValueSol - position.entryValue;
+    position.pnlRatio = position.entryValue > 0 ? currentValueSol / position.entryValue : 1;
+    this.touchPeak(position);
+  }
+
+  touchPeak(position) {
+    if ((position.currentValue || 0) >= (position.peakValue || 0)) {
+      position.peakValue = position.currentValue;
+      position.peakRatio = position.pnlRatio || 1;
+      position.peakTime = Date.now();
+    }
+  }
+
+  recordPartialSell(tokenMint, sellPct, reason) {
+    const position = this.activePositions.get(tokenMint);
+    if (!position) return;
+    position.remainingFraction = Math.max(0, (position.remainingFraction ?? 1) * (1 - sellPct));
+    position.lastPartialReason = reason;
+    position.lastPartialTime = Date.now();
+    if (position.remainingFraction <= 0.05) {
+      this.activePositions.delete(tokenMint);
+    }
+  }
+
+  markScaleLevel(tokenMint, levelKey) {
+    const position = this.activePositions.get(tokenMint);
+    if (!position || !levelKey) return;
+    if (!position.scaledLevelsHit) position.scaledLevelsHit = [];
+    if (!position.scaledLevelsHit.includes(levelKey)) {
+      position.scaledLevelsHit.push(levelKey);
     }
   }
 
@@ -198,8 +253,8 @@ class RiskManager {
   // Get position summary
   getPositionSummary() {
     const positions = this.getActivePositions();
-    const totalValue = positions.reduce((sum, pos) => sum + pos.currentValue, 0);
-    const totalPnL = positions.reduce((sum, pos) => sum + pos.pnl, 0);
+    const totalValue = positions.reduce((sum, pos) => sum + (pos.currentValue || 0), 0);
+    const totalPnL = positions.reduce((sum, pos) => sum + (pos.pnl || 0), 0);
 
     return {
       activePositions: positions.length,
